@@ -1,0 +1,300 @@
+#Automation of aws resource creation
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+ PermCarrierName:
+     Description: "Specify Carrier Name"
+     Type: String
+ ImageID:
+     Description: "Specify Image ID"
+     Type: AWS::EC2::Image::Id 
+ EnvironmentName: 
+    Description: "Specify Environment"
+    Type: String
+    AllowedValues: 
+     - "sandbox"
+     - "qa"
+     - "uat"
+     - "prod"
+     - "test"
+    ConstraintDescription: "Invalid environment name. Choose an environment from the list"
+ KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: EPAM-API
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+ InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+     - t1.micro
+     - t2.nano
+     - t2.micro
+     - t2.small
+     - t2.medium
+     - t2.large
+    ConstraintDescription: must be a valid EC2 instance type.
+ VPC:
+    Type: AWS::EC2::VPC::Id
+ SubnetID:
+    Type: AWS::EC2::Subnet::Id
+ MinSize:
+    Type : "String"
+    Default : "0"
+    Description : "The minimum size of the Auto Scaling group."
+ MaxSize: 
+    Type : "String"
+    Default : "2"
+    Description : "The maximum size of the Auto Scaling group."
+ #DesiredCapacity: 
+    #Type : "String"
+    #Default : "1"
+    #Description : "The desired size of the Auto Scaling group."
+   
+Resources:
+  PermQueue:
+    Type: 'AWS::SQS::Queue'
+    DependsOn: [PermQueueDead]
+    Properties:
+       DelaySeconds: 0
+       MaximumMessageSize: 262144 #256 KiB
+       MessageRetentionPeriod: 345600 #4 days
+       QueueName:  !Join [ "-", [perm,!Ref PermCarrierName ] ]
+       ReceiveMessageWaitTimeSeconds: 0
+       VisibilityTimeout: 120
+       RedrivePolicy: 
+        deadLetterTargetArn: 
+          Fn::GetAtt: 
+            - "PermQueueDead"
+            - "Arn"
+        maxReceiveCount:  3 #6 for AG
+  PermQueueDead:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+       QueueName:  !Join [ "-", [perm,!Ref PermCarrierName,dead ] ]      
+  QuoteInputQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+       DelaySeconds: 0
+       MaximumMessageSize: 262144 #256 KiB
+       MessageRetentionPeriod: 345600 #4 days
+       QueueName:  !Join [ "-", [quoteinput,!Ref EnvironmentName,!Ref PermCarrierName ] ]
+       ReceiveMessageWaitTimeSeconds: 0
+       VisibilityTimeout: 35
+  PermutationPdfParserLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: !Join [ "-", [permutationpdfparser,!Ref PermCarrierName ] ]
+      Code:
+        S3Bucket: !Join [ "-", [permquote-buildartifacts,!Ref EnvironmentName ] ] 
+        S3Key: pdf-parser-worker-1.0-SNAPSHOT.jar
+      Handler: 'PdfParserWorker.Services.PdfParserServiceV2::handleRequest'
+      Runtime: java8
+      Description: PDF parsing using lambda
+      MemorySize: 1024
+      Timeout: 30
+      Role:  !Join [ ":", ['arn:aws:iam:',!Ref 'AWS::AccountId','role/permquote-pdf-parser-role' ] ] #'arn:aws:iam::${AWS::AccountId}:role/permquote-pdf-parser-role'
+
+      Environment:
+        Variables:
+          QUOTE_TABLE: !Join [ "-", [permquote-v1,!Ref EnvironmentName ] ]
+
+  PermutationPdfParserEvents:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 2
+      Enabled: true
+      EventSourceArn: !GetAtt QuoteInputQueue.Arn
+      FunctionName: !GetAtt PermutationPdfParserLambda.Arn 
+    DependsOn: [QuoteInputQueue,PermutationPdfParserLambda] 
+  PermutationGeneratorLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: !Join [ "-", [PermutationGenerator,!Ref PermCarrierName ] ]
+      Code:
+        S3Bucket: !Join [ "-", [permquote-buildartifacts,!Ref EnvironmentName ] ] 
+        S3Key: PermutationGenerator.zip
+      Handler: 'PermutationGenerator::PermQuote.PermutationHandler::Handle'
+      Runtime: dotnetcore2.1
+      Description: Permutation Generator lambda
+      MemorySize: 2342
+      Timeout: 900
+      Role:  !Join [ ":", ['arn:aws:iam:',!Ref 'AWS::AccountId','role/permquote-s3read-lambda-role' ] ] #'arn:aws:iam::${AWS::AccountId}:role/permquote-s3read-lambda-role'
+ 
+      Environment:
+        Variables:
+          sqsurl: !Ref PermQueue
+
+  PermS3bucket:
+     Type: AWS::S3::Bucket
+     DependsOn: [PermutationGeneratorLambda,BucketPermission] 
+     Properties: 
+         BucketName:   !Join [ "-", [permquote-rule,!Ref EnvironmentName,!Ref PermCarrierName ] ]
+         NotificationConfiguration:
+           LambdaConfigurations:
+            - Event: "s3:ObjectCreated:*"
+              Function: !GetAtt PermutationGeneratorLambda.Arn
+  BucketPermission:
+      Type: AWS::Lambda::Permission
+      DependsOn: [PermutationGeneratorLambda] 
+      Properties:
+         Action: 'lambda:InvokeFunction'
+         FunctionName: !Ref PermutationGeneratorLambda
+         Principal: s3.amazonaws.com
+         SourceAccount: !Ref "AWS::AccountId"
+         SourceArn: !Join 
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Join [ "-", [permquote-rule,!Ref EnvironmentName,!Ref PermCarrierName ] ]
+  AutoScaling:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    DependsOn: [PermQueue,QuoteInputQueue,PermS3bucket,PermutationPdfParserLambda,PermutationPdfParserEvents,PermutationGeneratorLambda]
+    Properties:
+      AutoScalingGroupName: !Join [ "-", [perm-autoscaling-group,!Ref PermCarrierName ] ]
+      #AvailabilityZones:
+       # - "us-east-1a"
+      Cooldown: 300
+      #DesiredCapacity: !Ref DesiredCapacity
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref LaunchConfigurationName
+      MaxSize: !Ref MaxSize
+      MinSize: !Ref MinSize
+      VPCZoneIdentifier:
+         - !Ref SubnetID
+      Tags:
+        - Key: "Name"
+          Value: !Join [ "-", [permquote,!Ref PermCarrierName] ]
+          PropagateAtLaunch: true
+        - Key: "Environment"
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+        - Key: "Product"
+          Value: “Permquote” 
+          PropagateAtLaunch: true  
+  LaunchConfigurationName:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Properties:
+      #AssociatePublicIpAddress: true 
+      IamInstanceProfile: !Ref "InstanceProfile"
+      ImageId: !Ref ImageID
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref EC2instanceProfile
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+      UserData: 
+        Fn::Base64: !Sub |
+                   <powershell>
+                   Set-ExecutionPolicy Unrestricted -Force
+                   Remove-Item C:/carrier-app-worker -Recurse -Force
+                   New-Item -ItemType Directory -Force -Path C:/carrier-app-worker
+                   Read-S3Object -BucketName permquote-buildartifacts-${EnvironmentName} -Key "CarrierWorker.zip" -File "c:/carrier-app-worker/carrier-worker.zip"
+                   Expand-Archive -Path "c:/carrier-app-worker/carrier-worker.zip" -DestinationPath "C:/carrier-app-worker"
+                   $appSettings = [ordered]@{    "aws"= @{
+                                    "bucketName" = "permquote-pdf-${EnvironmentName}"
+                                    "sqspermquoteurl" = "${PermQueue}"
+                                    "sqsparserurl" = "${QuoteInputQueue}"
+                                    "NoOfMessgesToReadFromSQS" = 1
+                                    "sqspermquotedeadurl" = "${PermQueueDead}"
+                                  }
+                      "environment" = "${EnvironmentName}"
+                      "carrierName" = "${PermCarrierName}"
+                      "fileLength"= 10000
+                      "maxInputProcessTime"= 2
+                      "commonLogGroupName"= "carrier-workers-started"
+                       "AWS.Logging"= @{
+                      "Region"= "us-east-1"
+                     "LogGroup"= "carrier-worker-dev"
+                      "LogLevel"= @{
+                      "Default" = "Error"
+                      "System"= "Information"
+                      "Microsoft"= "Information"
+                           }
+                        }
+                       }
+                   $appSettings | ConvertTo-Json -depth 100 | Out-File C:/carrier-app-worker/net461/appsettings.json -Force
+                    </powershell>
+                   <persist>true</persist>
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: !Join [ "-", [permquote,!Ref PermCarrierName,securitygroup ] ]
+      GroupDescription: Enable EC2 instances to make RDP
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          
+      Tags:
+           - Key: "Name"
+             Value: !Join [ "-", [permquote,!Ref PermCarrierName,sg] ]
+      VpcId: !Ref VPC
+  EC2IamRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Policies:
+        - 
+          PolicyName: "sqs-full-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "sqs:*"
+                Resource: "*"
+        - 
+          PolicyName: "s3-full-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "s3:*"
+                Resource: "*"
+        - 
+             PolicyName: "dynamodb-full-access"
+             PolicyDocument: 
+                 Version: "2012-10-17"
+                 Statement: 
+                  - 
+                    Effect: "Allow"
+                    Action: "dynamodb:*"
+                    Resource: "*"
+        - 
+             PolicyName: "cloudwatchlogs-full-access"
+             PolicyDocument: 
+                 Version: "2012-10-17"
+                 Statement: 
+                  - 
+                    Effect: "Allow"
+                    Action: "logs:*"
+                    Resource: "*"
+
+      RoleName:  !Join [ "-", [permquote,!Ref PermCarrierName,role ] ]
+  EC2instanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties: 
+      Path: "/"
+      Roles: 
+        - Ref: "EC2IamRole"
+
+    
+
+
+   

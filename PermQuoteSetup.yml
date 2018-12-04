@@ -1,0 +1,165 @@
+#Automation of aws resource creation for one time setup
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+ EnvironmentName:
+    Description: "Specify Environment"
+    Type: String
+    AllowedValues:
+     - "sandbox"
+     - "qa"
+     - "uat"
+     - "prod"
+     - "test"
+Resources:
+  PermS3bucket:
+     Type: AWS::S3::Bucket
+     Properties:
+         BucketName:   !Join [ "-", [permquote-pdf,!Ref EnvironmentName ] ]
+  PermDynamodbTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+       AttributeDefinitions:
+        - AttributeName: "Id"
+          AttributeType: "S"
+        - AttributeName: "actualAge"
+          AttributeType: "S"
+        - AttributeName: "faceAmount"
+          AttributeType: "S"
+       KeySchema:
+        - AttributeName: "Id"
+          KeyType: "HASH"
+       GlobalSecondaryIndexes: 
+        - IndexName: "actualAge-faceAmount-index"
+          KeySchema: 
+            - AttributeName: "actualAge"
+              KeyType: "HASH"
+            - AttributeName: "faceAmount"
+              KeyType: "RANGE"
+          Projection: 
+            ProjectionType: "ALL"
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+       ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+       TableName: !Join [ "-", [permquote-v1,!Ref EnvironmentName ] ]
+  ApiGatewayLambda:
+    Type: "AWS::Lambda::Function"
+    DependsOn: [PermDynamodbTable]
+    Properties:
+      FunctionName: !Join [ "-", [permquote-api,!Ref EnvironmentName ] ]
+      Code:
+        S3Bucket: !Join [ "-", [permquote-buildartifacts,!Ref EnvironmentName ] ]
+        S3Key: LambdaAPI.zip
+      Handler: 'LambdaAPI::LambdaAPI.APILambdaFunction::APIRequestHandler'
+      Runtime: dotnetcore2.1
+      Description: API Gateway lambda
+      MemorySize: 1024
+      Timeout: 15
+      Role: 
+          Fn::GetAtt:
+           - ApiGatewayLambdaRole
+           - Arn  
+      Environment:
+        Variables:
+          DynamoDBTable: !Ref PermDynamodbTable
+  ApiGatewayLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ["-",[permquote-lambdarole-apigateway, !Ref EnvironmentName]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSQSFullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonAPIGatewayInvokeFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole  
+      Path: /
+  ApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: [ApiGatewayLambda,apiGateway]
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !GetAtt 'ApiGatewayLambda.Arn'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join
+        - ''
+        - - 'arn:aws:execute-api:'
+          - !Ref 'AWS::Region'
+          - ':'
+          - !Ref 'AWS::AccountId'
+          - ':'
+          - !Ref 'apiGateway' #Get getway id
+          - /*/POST/quotes
+  apiGateway:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: !Join [ "-", [permquote-api ,!Ref EnvironmentName ] ]
+      Description: "Permquote API"
+      EndpointConfiguration:
+          Types:
+            - PRIVATE
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: !Join [ ":", ['arn:aws:execute-api',!Ref 'AWS::Region',!Ref 'AWS::AccountId','*/*'  ] ]
+  apiResource:
+    Type: AWS::ApiGateway::Resource
+    DependsOn: [apiGateway]
+    Properties:
+      RestApiId:
+        Ref: "apiGateway"
+      ParentId:
+         Fn::GetAtt:
+           - "apiGateway"
+           - "RootResourceId"
+      PathPart: "quotes"
+  apiMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: [ApiGatewayLambda]
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      MethodResponses:
+       - StatusCode: 200
+         ResponseModels:
+          application/json: Empty
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        IntegrationResponses: 
+            - StatusCode: 200
+        Uri: !Join
+          - ''
+          - - 'arn:aws:apigateway:'
+            - !Ref 'AWS::Region'
+            - :lambda:path/2015-03-31/functions/
+            - !GetAtt 'ApiGatewayLambda.Arn'
+            - /invocations
+      ResourceId: !Ref 'apiResource'
+      RestApiId: !Ref 'apiGateway'
+  apiDeployment:
+       Type: AWS::ApiGateway::Deployment
+       DependsOn: [apiGateway,apiMethod]
+       Properties:
+            RestApiId: !Ref 'apiGateway'
+  apiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: [apiGateway]
+    Properties:
+      DeploymentId:  !Ref apiDeployment
+      RestApiId: !Ref 'apiGateway'
+      StageName: v1
